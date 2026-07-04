@@ -97,27 +97,59 @@ class ReactAgent:
                     final_answer = msg.content.strip()
                     break
 
-        # 第二步：通过 StreamingChatTongyi 做 token 级流式输出
+        # 第二步：通过 DashScope 原生 AioGeneration 做 token 级流式输出
         if final_answer:
             try:
-                model = chat_model()
-                system_prompt = load_system_prompts()
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": final_answer},
-                ]
-                # astream 是异步生成器，在同步函数中用新事件循环运行
                 import asyncio
+                from model.streaming_tongyi import _resolve_model_name
+                from model.factory import _get_chat_model
+
+                model = _get_chat_model()
+                if model is None:
+                    raise RuntimeError("Model not available")
+
+                # 获取系统提示词和模型名
+                system_prompt = load_system_prompts()
+                model_name = _resolve_model_name(model.model_name or "qwen3-max")
+
+                # 构建 DashScope 格式的消息
+                from model.streaming_tongyi import _build_ds_messages, _get_api_key
+                ds_messages = _build_ds_messages([
+                    type('SystemMessage', (), {'type': 'system', 'content': system_prompt})(),
+                    type('HumanMessage', (), {'type': 'human', 'content': final_answer})(),
+                ])
+
+                async def _stream_tokens():
+                    from dashscope import AioGeneration
+                    api_key = _get_api_key(model)
+                    coro = AioGeneration.call(
+                        model=model_name,
+                        messages=ds_messages,
+                        stream=True,
+                        api_key=api_key,
+                    )
+                    gen = await coro
+                    async for response in gen:
+                        delta = ""
+                        if hasattr(response, "output") and response.output:
+                            choices = response.output.choices
+                            if choices and len(choices) > 0:
+                                delta = choices[0].message.content or ""
+                        if delta:
+                            yield delta
+
+                # 在同步函数中运行异步生成器
                 loop = asyncio.new_event_loop()
                 try:
-                    async def _collect_tokens():
-                        tokens = []
-                        async for token in model.astream(messages):
-                            tokens.append(token)
-                        return tokens
-                    tokens = loop.run_until_complete(_collect_tokens())
-                    for token in tokens:
-                        yield token
+                    async_generator = _stream_tokens()
+                    # 逐 token yield
+                    import asyncio
+                    while True:
+                        try:
+                            token = loop.run_until_complete(async_generator.__anext__())
+                            yield token
+                        except StopAsyncIteration:
+                            break
                 finally:
                     loop.close()
             except Exception:
