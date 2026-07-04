@@ -33,19 +33,20 @@ if prompt and not st.session_state["processing"]:
         st.markdown(prompt)
     st.session_state["message"].append({"role": "user", "content": prompt})
 
-    # 2. 创建助手回复占位符，流式输出
+    # 2. 先显示"思考中"占位符
     with st.chat_message("assistant"):
-        assistant_placeholder = st.empty()
-        full_response = ""
+        thinking_placeholder = st.empty()
+        thinking_placeholder.markdown("🤖 智能客服思考中...")
 
+        full_response = ""
         try:
             for chunk in st.session_state["agent"].execute_stream(prompt):
                 full_response += chunk
-                # 实时更新占位符，实现打字机效果
-                assistant_placeholder.markdown(full_response)
+                # 有内容后，替换"思考中"为实际回复
+                thinking_placeholder.markdown(full_response)
         except Exception as e:
             full_response = f"抱歉，服务暂时不可用，请稍后重试。（错误: {e}）"
-            assistant_placeholder.error(full_response)
+            thinking_placeholder.error(full_response)
 
     # 3. 保存完整回复到历史消息
     st.session_state["message"].append({"role": "assistant", "content": full_response})
