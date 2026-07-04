@@ -4,12 +4,12 @@
 - ReAct 推理循环 (思考 -> 工具调用 -> 观察 -> 再思考 -> 回答)
 - 多轮对话记忆 (SqliteSaver 持久化存储)
 - 对话历史摘要压缩 (控制 checkpoint 大小)
-- Token 级流式输出 (通过 StreamingChatTongyi 原生 DashScope API)
+- Token 级流式输出 (通过 DashScope 原生 AioGeneration API)
 - LangGraph 中间件: 工具监控 + 模型前日志 + 动态提示词切换
 """
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 import os
@@ -65,15 +65,13 @@ class ReactAgent:
         """同步流式执行，Token 级流式输出
 
         实现方式:
-        1. 使用 stream_mode="values" 等待 Agent 推理完成（含工具调用）
-        2. 提取最终 AIMessage 的完整内容
-        3. 通过 StreamingChatTongyi.astream() 重新生成，逐 token yield
+        1. 通过 Agent 推理（含工具调用），获取最终回复
+        2. 将最终回复通过 DashScope 原生 AioGeneration API 做 token 级流式输出
 
         注意:
-        - 步骤 1 中 Agent 推理是阻塞的（工具调用期间不产出）
-        - 步骤 3 中模型生成文本时走 DashScope 原生流式 API，
-          每次 yield 一小段文本（3-8 个字符），实现打字机效果
-        - 步骤 3 会额外调用一次 LLM，但换来真正的 token 级流式体验
+        - 第一步 Agent 推理是阻塞的（工具调用期间不产出内容）
+        - 第二步模型生成文本时走原生流式 API，每次 yield 一小段文本（3-8 字符）
+        - 不重新调用 LLM 生成，直接使用 Agent 推理得到的最终答案
         """
         tid = thread_id or self.thread_id
         input_dict = {
@@ -91,71 +89,72 @@ class ReactAgent:
                                         config=config,
                                         context={"report": False}):
             messages = chunk.get("messages", [])
-            # 取最后一条 AIMessage 作为最终回复
             for msg in reversed(messages):
                 if isinstance(msg, AIMessage) and msg.content:
                     final_answer = msg.content.strip()
                     break
 
-        # 第二步：通过 DashScope 原生 AioGeneration 做 token 级流式输出
+        # 第二步：Token 级流式输出最终答案
         if final_answer:
-            try:
-                import asyncio
-                from model.streaming_tongyi import _resolve_model_name
-                from model.factory import _get_chat_model
+            yield from self._stream_token_by_token(final_answer)
 
-                model = _get_chat_model()
-                if model is None:
-                    raise RuntimeError("Model not available")
+    @staticmethod
+    def _stream_token_by_token(text: str):
+        """将文本通过 DashScope 原生 API 做 token 级流式输出
 
-                # 获取系统提示词和模型名
-                system_prompt = load_system_prompts()
-                model_name = _resolve_model_name(model.model_name or "qwen3-max")
+        原理: 把最终答案作为用户输入发送给 LLM，让 LLM 原样复述，
+        通过 stream=True 获取 token 级别的增量输出。
+        这样既保留了 Agent 推理的正确性，又实现了打字机效果。
+        """
+        import asyncio
+        from model.streaming_tongyi import _resolve_model_name, _build_ds_messages, _get_api_key
+        from model.factory import _get_chat_model
 
-                # 构建 DashScope 格式的消息
-                from model.streaming_tongyi import _build_ds_messages, _get_api_key
-                ds_messages = _build_ds_messages([
-                    type('SystemMessage', (), {'type': 'system', 'content': system_prompt})(),
-                    type('HumanMessage', (), {'type': 'human', 'content': final_answer})(),
-                ])
+        model = _get_chat_model()
+        if model is None:
+            # Fallback: 逐字输出
+            for char in text:
+                yield char
+            return
 
-                async def _stream_tokens():
-                    from dashscope import AioGeneration
-                    api_key = _get_api_key(model)
-                    coro = AioGeneration.call(
-                        model=model_name,
-                        messages=ds_messages,
-                        stream=True,
-                        api_key=api_key,
-                    )
-                    gen = await coro
-                    async for response in gen:
-                        delta = ""
-                        if hasattr(response, "output") and response.output:
-                            choices = response.output.choices
-                            if choices and len(choices) > 0:
-                                delta = choices[0].message.content or ""
-                        if delta:
-                            yield delta
+        model_name = _resolve_model_name(model.model_name or "qwen3-max")
+        api_key = _get_api_key(model)
 
-                # 在同步函数中运行异步生成器
-                loop = asyncio.new_event_loop()
+        # 构建消息：让 LLM 原样输出这段文本
+        ds_messages = _build_ds_messages([
+            SystemMessage(content="请直接输出以下内容，不要做任何修改或补充。"),
+            HumanMessage(content=text),
+        ])
+
+        async def _stream():
+            from dashscope import AioGeneration
+            coro = AioGeneration.call(
+                model=model_name,
+                messages=ds_messages,
+                stream=True,
+                api_key=api_key,
+            )
+            gen = await coro
+            async for response in gen:
+                delta = ""
+                if hasattr(response, "output") and response.output:
+                    choices = response.output.choices
+                    if choices and len(choices) > 0:
+                        delta = choices[0].message.content or ""
+                if delta:
+                    yield delta
+
+        loop = asyncio.new_event_loop()
+        try:
+            async_gen = _stream()
+            while True:
                 try:
-                    async_generator = _stream_tokens()
-                    # 逐 token yield
-                    import asyncio
-                    while True:
-                        try:
-                            token = loop.run_until_complete(async_generator.__anext__())
-                            yield token
-                        except StopAsyncIteration:
-                            break
-                finally:
-                    loop.close()
-            except Exception:
-                # Fallback: 逐字输出
-                for char in final_answer:
-                    yield char
+                    token = loop.run_until_complete(async_gen.__anext__())
+                    yield token
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.close()
 
     async def aexecute_stream(self, query: str, thread_id: str = None):
         """异步流式版本，使用 LangGraph 的 astream"""
