@@ -38,7 +38,7 @@ def listdir_with_allowed_type(path: str, allowed_types: tuple[str]):  # 返回�
 
     if not os.path.isdir(path):
         logger.error(f"[listdir_with_allowed_type]{path}不是文件夹")
-        return allowed_types
+        return []
 
     for f in os.listdir(path):
         if f.endswith(allowed_types):

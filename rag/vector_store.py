@@ -1,3 +1,13 @@
+"""向量库管理服务（已迁移至 rag/rag_service.py）
+
+此文件保留向后兼容。新的 RAGService 在 rag/rag_service.py 中实现，
+包含四层检索、异步化、RAG 生成管线等完整功能。
+
+如需直接使用向量库操作，可通过 RAGService._vectorstore 访问。
+"""
+
+from __future__ import annotations
+
 import os
 
 from langchain_chroma import Chroma
@@ -5,96 +15,57 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from model.factory import embed_model
 from utils.config_handler import chroma_conf
-from utils.file_handler import txt_loader, pdf_loader, listdir_with_allowed_type, get_file_md5_hex
 from utils.logger_handler import logger
 from utils.path_tool import get_abs_path
 
 
-class VectorStoreService:
-    def __init__(self):
-        self.vector_store = Chroma(
-          collection_name=chroma_conf["collection_name"],
-          embedding_function=embed_model,
-          persist_directory=chroma_conf["persist_directory"],#存储路径
+class VectorStoreManager:
+    """
+    向量库基础管理（薄封装，实际功能在 RAGService 中）。
+
+    保留此类以兼容旧代码中直接操作向量库的场景。
+    """
+
+    def __init__(self) -> None:
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        persist_dir = os.path.join(
+            project_root, chroma_conf.get("persist_directory", "chroma_db")
         )
-        self.spliter = RecursiveCharacterTextSplitter(
-            chunk_size=chroma_conf["chunk_size"],
-            chunk_overlap=chroma_conf["chunk_overlap"],
-            separators=chroma_conf["separators"],
-            length_function=len,#长度统计
+        self._store = Chroma(
+            collection_name=chroma_conf.get("collection_name", "agent"),
+            embedding_function=embed_model(),
+            persist_directory=persist_dir,
         )
-    def get_retriever(self):
-        return self.vector_store.as_retriever(search_kwargs={"k": chroma_conf["k"]})
-
-    def load_document(self):
-
-        def check_md5_hex(md5_for_check: str):
-            if not os.path.exists(get_abs_path(chroma_conf["md5_hex_store"])):
-
-                open(get_abs_path(chroma_conf["md5_hex_store"]), "w",encoding="utf-8").close()
-                return False
-            with open(get_abs_path(chroma_conf["md5_hex_store"]), "r",encoding="utf-8") as f:
-                for line in f.readlines():
-                    line = line.strip()
-                    if line == md5_for_check:
-                        return True
-                return False
-
-        def save_md5_hex(md5_for_check: str):
-            with open(get_abs_path(chroma_conf["md5_hex_store"]), "a",encoding="utf-8") as f:
-                f.write(md5_for_check+"\n")
-
-        def get_file_documents(read_path: str):
-            if read_path.endswith("txt"):
-                return txt_loader(read_path)
-
-            if read_path.endswith("pdf"):
-                return pdf_loader(read_path)
-
-            return []
-
-        allowed_files_path: list[str] = listdir_with_allowed_type(
-            get_abs_path(chroma_conf["data_path"]),
-            tuple(chroma_conf["allow_knowledge_file_type"]),
+        self._spliter = RecursiveCharacterTextSplitter(
+            chunk_size=chroma_conf.get("chunk_size", 1000),
+            chunk_overlap=chroma_conf.get("chunk_overlap", 100),
+            separators=chroma_conf.get(
+                "separators", ["\n\n", "\n", ".", "!", "?", "。", " ", ""]
+            ),
+            length_function=len,
         )
-        for path in allowed_files_path:
-            # 获取文件的MD5
-            md5_hex = get_file_md5_hex(path)
 
-            if check_md5_hex(md5_hex):
-                logger.info(f"[加载知识库]{path}内容已经存在知识库内，跳过")
-                continue
+    def get_retriever(self, k: int | None = None):
+        """返回 LangChain retriever"""
+        k = k or chroma_conf.get("k", 3)
+        return self._store.as_retriever(search_kwargs={"k": k})
 
-            try:
-                documents: list[Document] = get_file_documents(path)
+    @property
+    def store(self) -> Chroma:
+        """直接访问底层 Chroma 实例"""
+        return self._store
 
-                if not documents:
-                    logger.warning(f"[加载知识库]{path}内没有有效文本内容，跳过")
-                    continue
+    def split_text(self, text: str) -> list[Document]:
+        """将文本分割为文档块"""
+        doc = Document(page_content=text)
+        return self._spliter.split_documents([doc])
 
-                split_document: list[Document] = self.spliter.split_documents(documents)
+    def add_texts(self, texts: list[str], metadata: dict | None = None) -> None:
+        """批量添加文本到向量库"""
+        docs = [Document(page_content=t, metadata=metadata or {}) for t in texts]
+        self._store.add_documents(docs)
+        logger.info(f"[VectorStoreManager] 添加了 {len(texts)} 条文本")
 
-                if not split_document:
-                    logger.warning(f"[加载知识库]{path}分片后没有有效文本内容，跳过")
-                    continue
-
-                # 将内容存入向量库
-                self.vector_store.add_documents(split_document)
-
-                # 记录这个已经处理好的文件的md5，避免下次重复加载
-                save_md5_hex(md5_hex)
-
-                logger.info(f"[加载知识库]{path} 内容加载成功")
-            except Exception as e:
-                #exc_info为ture会记录详细的报错堆栈
-                logger.error(f"[加载知识库]{path}加载失败: {str(e)}",exc_info=True)
-                continue
-
-if __name__ == '__main__':
-    sv = VectorStoreService()
-    sv.load_document()
-    retriever=sv.get_retriever()
-    res=retriever.invoke("迷路")
-    for r in res:
-        print(r.page_content)
-        print("_"*20)
+    def similarity_search(self, query: str, k: int = 3) -> list[Document]:
+        """相似度搜索"""
+        return self._store.similarity_search(query, k=k)

@@ -1,5 +1,3 @@
-import time
-
 import streamlit as st
 
 from agent.react_agent import ReactAgent
@@ -17,34 +15,32 @@ if "message" not in st.session_state:
 
 # 渲染历史消息
 for message in st.session_state["message"]:
-    st.chat_message(message["role"]).write(message["content"])
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
 # 用户输入提示词
 prompt = st.chat_input()
 
 if prompt:
     # 1. 显示用户消息
-    st.chat_message("user").write(prompt)
+    with st.chat_message("user"):
+        st.markdown(prompt)
     st.session_state["message"].append({"role": "user", "content": prompt})
 
-    # 2. 准备调用 Agent
-    response_messages = []
+    # 2. 使用 st.chat_message + st.empty 实现流式打字效果
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        full_response = ""
 
-    with st.spinner("智能客服思考..."):
-        res_stream = st.session_state["agent"].execute_stream(prompt)
+        try:
+            for chunk in st.session_state["agent"].execute_stream(prompt):
+                full_response += chunk
+                # 实时更新 markdown 内容
+                placeholder.markdown(full_response)
+        except Exception as e:
+            full_response = f"抱歉，服务暂时不可用，请稍后重试。（错误: {e}）"
+            placeholder.error(full_response)
 
-
-    # 定义 capture 函数（如果 ReactAgent 内部没做流式处理，可以在这里包裹）
-
-    def capture(generator, cache_list):
-        for chunk in generator:
-            cache_list.append(chunk)
-
-            for char in chunk:
-                time.sleep(0.01)
-                yield char
-
-
-    st.chat_message("assistant").write_stream(capture(res_stream, response_messages))
-    st.session_state["message"].append({"role": "assistant", "content": response_messages[-1]})
+    # 3. 保存完整回复到历史消息
+    st.session_state["message"].append({"role": "assistant", "content": full_response})
     st.rerun()

@@ -51,6 +51,15 @@ chat__history/
 # MD5 cache
 md5.text
 
+# Database files
+*.db
+data/agent_memory.db
+data/test.db
+data/test2.db
+
+# Interview guide (local reference only)
+INTERVIEW_GUIDE.md
+
 # OS files
 .DS_Store
 Thumbs.db
