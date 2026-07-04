@@ -5,6 +5,7 @@
 - 使用 @lru_cache 懒加载，避免模块导入时网络不可用导致崩溃
 - 每个模型注册独立熔断器，实现真正的三级降级
 - 所有模型创建包裹 try/except，失败时记录日志而非直接崩溃
+- 使用 StreamingChatTongyi 替代 ChatTongyi，实现真正的 token 级流式输出
 """
 
 from abc import ABC, abstractmethod
@@ -16,6 +17,7 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.chat_models.tongyi import ChatTongyi
 
 from model.router import ModelRouter, Priority, CircuitBreaker
+from model.streaming_tongyi import StreamingChatTongyi
 from utils.config_handler import rag_conf
 from utils.logger_handler import logger
 
@@ -27,11 +29,11 @@ class BaseModelFactory(ABC):
 
 
 class ChatModelFactory(BaseModelFactory):
-    """聊天模型工厂 —— 创建通义千问实例"""
-    def generator(self) -> Optional[ChatTongyi]:
+    """聊天模型工厂 —— 创建通义千问实例（支持 token 级流式）"""
+    def generator(self) -> Optional[StreamingChatTongyi]:
         model_name = rag_conf.get("chat_model_name", "qwen3-max")
-        logger.info(f"[ChatModelFactory] 创建模型: {model_name}")
-        return ChatTongyi(model=model_name)
+        logger.info(f"[ChatModelFactory] 创建模型: {model_name} (StreamingChatTongyi)")
+        return StreamingChatTongyi(model=model_name)
 
 
 class EmbeddingsFactory(BaseModelFactory):
@@ -46,8 +48,8 @@ class EmbeddingsFactory(BaseModelFactory):
 
 
 @lru_cache(maxsize=1)
-def _get_chat_model() -> ChatTongyi | None:
-    """懒加载聊天模型，创建失败时返回 None"""
+def _get_chat_model() -> StreamingChatTongyi | None:
+    """懒加载聊天模型（流式版），创建失败时返回 None"""
     try:
         factory = ChatModelFactory()
         return factory.generator()
@@ -79,29 +81,29 @@ def _build_router() -> ModelRouter:
             primary, Priority.HIGH, primary_name,
             failure_threshold=5, recovery_timeout=30.0,
         )
-        logger.info(f"[Router] 注册主模型: {primary_name} (HIGH)")
+        logger.info(f"[Router] 注册主模型: {primary_name} (HIGH, Streaming)")
 
     # 降级模型 1：qwen-plus
     fallback_name = "qwen-plus"
     try:
-        fallback_model = ChatTongyi(model=fallback_name)
+        fallback_model = StreamingChatTongyi(model=fallback_name)
         router_obj.register_model(
             fallback_model, Priority.MEDIUM, fallback_name,
             failure_threshold=3, recovery_timeout=60.0,
         )
-        logger.info(f"[Router] 注册降级模型: {fallback_name} (MEDIUM)")
+        logger.info(f"[Router] 注册降级模型: {fallback_name} (MEDIUM, Streaming)")
     except Exception as e:
         logger.warning(f"[Router] 降级模型 {fallback_name} 创建失败: {e}")
 
     # 兜底模型：qwen-turbo
     turbo_name = "qwen-turbo"
     try:
-        turbo_model = ChatTongyi(model=turbo_name)
+        turbo_model = StreamingChatTongyi(model=turbo_name)
         router_obj.register_model(
             turbo_model, Priority.LOW, turbo_name,
             failure_threshold=2, recovery_timeout=120.0,
         )
-        logger.info(f"[Router] 注册兜底模型: {turbo_name} (LOW)")
+        logger.info(f"[Router] 注册兜底模型: {turbo_name} (LOW, Streaming)")
     except Exception as e:
         logger.warning(f"[Router] 兜底模型 {turbo_name} 创建失败: {e}")
 

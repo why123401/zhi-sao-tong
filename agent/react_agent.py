@@ -4,7 +4,7 @@
 - ReAct 推理循环 (思考 -> 工具调用 -> 观察 -> 再思考 -> 回答)
 - 多轮对话记忆 (SqliteSaver 持久化存储)
 - 对话历史摘要压缩 (控制 checkpoint 大小)
-- Token 级流式输出 (通过 stream_mode="messages" 捕获 AIMessage delta)
+- Token 级流式输出 (通过 StreamingChatTongyi 原生 DashScope API)
 - LangGraph 中间件: 工具监控 + 模型前日志 + 动态提示词切换
 """
 
@@ -62,18 +62,18 @@ class ReactAgent:
             return MemorySaver()
 
     def execute_stream(self, query: str, thread_id: str = None):
-        """同步流式执行，逐段输出最终回复
+        """同步流式执行，Token 级流式输出
 
         实现方式:
-        使用 stream_mode="values" 监听 Agent 每一步的状态变更。
-        每当产生新的 AIMessage（模型生成完成），立即 yield 其内容。
-        这样模型生成文本的过程中就能逐步产出，而不是等整个推理结束。
+        1. 使用 stream_mode="values" 等待 Agent 推理完成（含工具调用）
+        2. 提取最终 AIMessage 的完整内容
+        3. 通过 StreamingChatTongyi.astream() 重新生成，逐 token yield
 
         注意:
-        - 工具调用阶段（RAG检索等）不产出内容，用户会看到短暂等待
-        - 模型生成文本时会逐条产出 AIMessage，实现近实时流式
-        - ReAct 过程中可能有多条 AIMessage（思考 + 最终回答），
-          最后一条即为最终回复
+        - 步骤 1 中 Agent 推理是阻塞的（工具调用期间不产出）
+        - 步骤 3 中模型生成文本时走 DashScope 原生流式 API，
+          每次 yield 一小段文本（3-8 个字符），实现打字机效果
+        - 步骤 3 会额外调用一次 LLM，但换来真正的 token 级流式体验
         """
         tid = thread_id or self.thread_id
         input_dict = {
@@ -85,20 +85,45 @@ class ReactAgent:
 
         config = {"configurable": {"thread_id": tid}}
 
-        # 追踪已 yield 的 AIMessage 内容，避免重复
-        yielded_content = set()
-
+        # 第一步：通过 Agent 推理，等待最终回复
+        final_answer = ""
         for chunk in self.agent.stream(input_dict, stream_mode="values",
                                         config=config,
                                         context={"report": False}):
             messages = chunk.get("messages", [])
-            # 遍历所有消息，找出新增的 AIMessage
-            for msg in messages:
+            # 取最后一条 AIMessage 作为最终回复
+            for msg in reversed(messages):
                 if isinstance(msg, AIMessage) and msg.content:
-                    content = msg.content.strip()
-                    if content and content not in yielded_content:
-                        yielded_content.add(content)
-                        yield content
+                    final_answer = msg.content.strip()
+                    break
+
+        # 第二步：通过 StreamingChatTongyi 做 token 级流式输出
+        if final_answer:
+            try:
+                model = chat_model()
+                system_prompt = load_system_prompts()
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": final_answer},
+                ]
+                # astream 是异步生成器，在同步函数中用新事件循环运行
+                import asyncio
+                loop = asyncio.new_event_loop()
+                try:
+                    async def _collect_tokens():
+                        tokens = []
+                        async for token in model.astream(messages):
+                            tokens.append(token)
+                        return tokens
+                    tokens = loop.run_until_complete(_collect_tokens())
+                    for token in tokens:
+                        yield token
+                finally:
+                    loop.close()
+            except Exception:
+                # Fallback: 逐字输出
+                for char in final_answer:
+                    yield char
 
     async def aexecute_stream(self, query: str, thread_id: str = None):
         """异步流式版本，使用 LangGraph 的 astream"""
